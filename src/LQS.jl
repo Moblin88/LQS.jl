@@ -5,8 +5,9 @@ using Random
 using Base.Threads
 
 function solve(Q::AbstractMatrix{<:Real};
-               max_stagnation::Int = 1000,
-               max_candidates::Int = 10000)
+               max_stagnation = size(Q, 1),
+               max_candidates = 10*size(Q, 1),
+               hot_start = nothing)
     
     twoQmD, d = separateq(Q) # separate Q into twoQmD = 2*(Q-Diagonal(Q)) and d = diag(Q)
     # prune A so that we remove dominant elements
@@ -14,12 +15,15 @@ function solve(Q::AbstractMatrix{<:Real};
     candidate_channel = Channel{@NamedTuple{objective::T, x::Vector{T}}}() # Channel to hold candidates
     checker_task = Task() do 
         check_candidates(max_stagnation, max_candidates) do 
-            take!(candidate_channel)
+            take!(candidate_channel) 
         end
     end # Task to check candidates
     checker_task.sticky = false # Make the task non-sticky to allow it to change threads
     bind(candidate_channel, checker_task) # Bind the channel to the task so it kills producers when it's done
     schedule(checker_task) # Schedule the task to run
+    if !isnothing(hot_start)
+        put!(candidate_channel, find_local_max(twoQmD, d, hot_start)) # If a hot start is provided, use it to produce the first candidate
+    end
     for _ in 1:Threads.threadpoolsize()
         @spawn produce_candidates(candidate_channel, twoQmD, d) # Spawn a thread to produce candidates
     end
@@ -27,14 +31,21 @@ function solve(Q::AbstractMatrix{<:Real};
 end
 
 function solve_single_thread(Q::AbstractMatrix{<:Real};
-               max_stagnation::Int = 1000,
-               max_candidates::Int = 10000)
+               max_stagnation = 10*size(Q, 1),
+               max_candidates = 100*size(Q, 1),
+               hot_start = nothing)
     
     twoQmD, d = separateq(Q) # separate Q into twoQmD = 2*(Q-Diagonal(Q)) and d = diag(Q)
     # prune A so that we remove dominant elements
     
     return check_candidates(max_stagnation, max_candidates) do 
-        find_local_max(twoQmD, d)
+        started = Ref(!isnothing(hot_start)) # Reference to check if hot start was used
+        if started[]
+            started[] = false # Set the hot start flag to false
+            return find_local_max(twoQmD, d, hot_start) # If no hot start is provided, use a random starting point
+        else
+            return find_local_max(twoQmD, d)
+        end
     end
 end
 
@@ -61,6 +72,12 @@ function check_candidates(produce_candidate, max_stagnation, max_candidates)
     return best
 end
 
+"""
+    produce_candidates(candidate_channel, twoQmD, d)
+
+Task loop that continuously produces candidates by finding local maxima using the provided `twoQmD` and `d`.
+This function runs indefinitely, putting candidates into the `candidate_channel`, so be sure to bind that channel to a conunsumer task that will stop it when it has enough candidates.
+"""
 function produce_candidates(candidate_channel, twoQmD, d)
     while true
         put!(candidate_channel, find_local_max(twoQmD, d)) # Find a local maximum and put it in the channel
@@ -81,45 +98,90 @@ function update_sensitivity!(sensitivity, twoQmD, x, i)
     else
         sensitivity .+= (1 .- 2 .* x) .* col # If the ith bit is 0, add the column, otherwise subtract it
     end
-    sensitivity[i] = -sensitivity[i]  # Flip the sign of the ith sensitivity value
+    sensitivity[i] = -sensitivity[i]
     return sensitivity
 end
 
+"""
+    set_sensitivity!(sensitivity, twoQmD, d, x)
+
+Set the sensitivity vector in place based on the current solution vector `x`.
+This function computes the sensitivity vector from scratch, which is slower than `update_sensitivity!`, but is used to initialize the sensitivity vector.
+"""
+function set_sensitivity!(sensitivity, twoQmD, d, x)
+    sensitivity .= d # Initialize the sensitivity vector with the diagonal elements
+    mul!(sensitivity, twoQmD, x, true, true) # Compute the sensitivity vector
+    sensitivity .= ifelse.(x .=== one(eltype(x)), .-sensitivity, sensitivity) # Flip the sign of the sensitivity vector where x is 1
+    return sensitivity
+end
 
 """
-    find_local_max(twoQmD, d)
+    jump_update!(x, sensitivity, twoQmD, d)
 
-Compute a local maximum from a random starting point using the provided `twoQmD` and `d`.
+Update the solution vector `x` by flipping bits where the sensitivity is positive.
+Update sensitivity vector after the jump.
+Returns the updated objective value.
+
+This function may not always improve the soltion, but can be faster than a step update on a low-quality solution.
 """
-function find_local_max(twoQmD, d)
-    T = promote_type(eltype(twoQmD), eltype(d)) # Determine the type for the solution vector
-    x = Vector{T}(bitrand(length(d))) # Randomly initialize the solution vector
+function jump_update!(x, sensitivity, twoQmD, d)
+    x .= ifelse.(sensitivity .> zero(eltype(sensitivity)), one(eltype(x)) .- x, x) # Flip bits where sensitivity is positive
+    set_sensitivity!(sensitivity, twoQmD, d, x) # Recompute the objective value and sensitivity vector after the jump
+    return compute_objective(twoQmD, d, x) # Return the updated objective value
+end
+
+"""
+    step_update!(x, sensitivity, twoQmD, objective)
+
+Update the solution vector `x` by flipping the bit at index `i` where the sensitivity is maximum and greater than 0.
+Update the sensitivity vector after the update.
+Returns the updated objective value.
+
+This function is guaranteed to improve the solution if there is a positive sensitivity value.
+"""
+function step_update!(x, sensitivity, twoQmD, objective)
+    improvement, i = findmax(sensitivity)
+    if improvement <= zero(objective)
+        return objective
+    end
+    update_sensitivity!(sensitivity, twoQmD, x, i) # Update the sensitivity vector
+    @inbounds x[i] = one(eltype(x)) - x[i] # Change the ith bit in the solution vector
+    objective += improvement # Update the objective value
+    return objective # Return the updated solution
+end
+
+"""
+    find_local_max(twoQmD, d [,x])
+
+Compute a local maximum from a starting point `x` starting point using the provided `twoQmD` and `d`.
+If `x` is not provided, a random starting point is used.
+Returns a named tuple with the objective value and the solution vector `x`.
+"""
+function find_local_max(twoQmD, d, x = Vector{promote_type(eltype(twoQmD), eltype(d))}(bitrand(length(d))))
     # use a vector of 1 or 0 Ts instead of a BitVector for better performance and simd support
-    objective, sensitivity = initalize_soltion(twoQmD, d, x) # Compute the initial sensitivity vector and objective value
+    sensitivity = similar(d) # Create a sensitivity vector to hold the sensitivity values
+    set_sensitivity!(sensitivity, twoQmD, d, x) # Compute the initial sensitivity vector 
     # do a one time jump update
-    x .= ifelse.(sensitivity .> zero(T), one(T) .- x, x) # Flip bits where sensitivity is positive
-    objective, sensitivity = initalize_soltion(twoQmD, d, x) # Recompute the objective value and sensitivity vector after the jump
+    objective = jump_update!(x, sensitivity, twoQmD, d) # Update the solution vector and objective value
     # iteratively improve the solution one bit at a time
     while true
-        improvement, i = findmax(sensitivity)
-        if improvement <= zero(T)
-            # No improvement found, we are in a local maximum
-            return (objective=objective, x=x)
+        newobjective = step_update!(x, sensitivity, twoQmD, objective) # Update the solution vector and objective value
+        if newobjective == objective # If the objective value did not change, we are done
+            return (objective = objective, x = x) # Return the best solution found
         else
-            # we have an improvement
-            update_sensitivity!(sensitivity, twoQmD, x, i) # Update the sensitivity vector
-            @inbounds x[i] = one(T) - x[i] # change the ith bit in the solution vector
-            objective += improvement # Update the objective value
+            objective = newobjective # Update the objective value
         end
     end
 end
 
 
-function initalize_soltion(twoQmD, d, x)
-    sensitivity =  muladd(twoQmD, x, d) # Compute the sensitivity vector
-    sensitivity .= ifelse.(x .=== one(eltype(x)), .-sensitivity, sensitivity) # Flip the sign of the sensitivity vector where x is 1
-    objective = x' * UpperTriangular(twoQmD) * x + d⋅x # Initial objective value
-    return objective, sensitivity
+"""
+    compute_objective(twoQmD, d, x)
+
+Compute the objective value for a given solution vector `x`, matrix `twoQmD`, and vector `d`.
+"""
+function compute_objective(twoQmD, d, x)
+    return x' * UpperTriangular(twoQmD) * x + d ⋅ x
 end
 
 """
@@ -130,7 +192,7 @@ Separate the matrix `Q` into two parts: `twoQmD` which contains the off-diagonal
 returns `twoQmD` and `d`.
 """
 function separateq(Q)
-    twoQmD = Q .+ Q' .- 2*Diagonal(Q) # Create a new matrix with doubled off-diagonal elements
+    twoQmD = Q .+ Q' .- convert(eltype(Q),2)*Diagonal(Q) # Create a new matrix with doubled off-diagonal elements
     d = convert(Vector,diag(Q)) # Extract the diagonal elements in a dense vector
     return twoQmD, d
 end
