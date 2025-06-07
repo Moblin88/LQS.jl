@@ -4,33 +4,74 @@ using LinearAlgebra
 using Random
 using Base.Threads
 
-function solve(Q::AbstractMatrix{<:Real};
+function solve(Q;
+    hot_start=nothing,
     max_stagnation=size(Q, 1),
     max_candidates=10 * size(Q, 1),
-    hot_start=nothing,
     ntasks=Threads.threadpoolsize(),
     njumps=5,
-    prune=true)
+    prune=true,
+    decompose=true)
     T = eltype(Q) # Determine the type for the solution vector
-    Q̄, d = separateq(Q) # separate Q into Q̄ = Q + Q' - 2 * Diagonal(Q) and d = diag(Q)
+    Q̄, d = utform(Q) # separate Q into Q̄ = Q + Q' - 2 * Diagonal(Q) and d = diag(Q)
     # prune Q̄ and d to remove elements that are always 0 or 1
-    pruned_indices = Vector{@NamedTuple{is::Vector{Int}, xᵢ::T, objΔ::T}}() # Vector to hold the indices of the pruned elements
-    prune && (Q̄ = prune!(pruned_indices, d, Q̄)) # Prune the elements of Q̄ and d that are always 0 or 1
+    pruned_indices = @NamedTuple{is::Vector{Int}, xᵢ::T, objΔ::T}[] # Vector to hold the indices of the pruned elements
+    if prune
+        Q̄ = prune!(pruned_indices, d, Q̄)
+    end # Prune the elements of Q̄ and d that are always 0 or 1
+    hot_start = prunex!(deepcopy(hot_start), pruned_indices) # Prune the hot start vector if it is provided
+    if decompose
+        indexsets = separate_components(Q̄) # Decompose Q̄ into connected components
+    else
+        indexsets = [BitSet(axes(Q̄, 2))] # If not decomposing, use all indices as a single component
+    end
+    obj = zero(T) # Initialize the objective value
+    x = Vector{T}(undef, size(Q̄, 2)) # Initialize the solution vector
+    for indexset in indexsets # For each connected component
+        is = collect(indexset) # Convert the BitSet to a vector of indices
+        #@info "Solving connected component with indices $(is)"
+        solution = solve(
+            Q̄[is,is], 
+            d[is];
+            hot_start=filterx(hot_start, is),
+            max_stagnation=max_stagnation,
+            max_candidates=max_candidates,
+            ntasks=ntasks,
+            njumps=njumps)
+        obj += solution.objective # Update the objective value
+        x[is] .= solution.x # Update the solution vector with the solution for the connected component
+    end
+    
+    return unprune((objective=obj, x=x), pruned_indices) # unprune the final result
+end
+
+function filterx(x, indices)
+    isnothing(x) && return nothing # If x is nothing, return nothing
+    return x[indices] # Return the elements of x at the specified indices
+end
+
+function solve(Q̄,d;
+    hot_start=nothing,
+    max_stagnation=size(Q̄, 1),
+    max_candidates=10 * size(Q̄, 1),
+    ntasks=Threads.threadpoolsize(),
+    njumps=5)
+    T = promote_type(eltype(Q̄), eltype(d)) # Determine the type for the solution vector
     candidate_channel = Channel{@NamedTuple{objective::T, x::Vector{T}}}() # Channel to hold candidates
     checker_task = @task check_candidates!(candidate_channel, max_stagnation, max_candidates) # Task to check candidates in the channel
     checker_task.sticky = false
     bind(candidate_channel, checker_task) # Bind the channel to the task so it can be closed when the task is done
     schedule(checker_task) # Schedule the task to run
     if !isnothing(hot_start)
-        put_local_max!(candidate_channel, Q̄, d, prunex!(deepcopy(hot_start), pruned_indices); njumps=njumps)# produce the first candidate
+        put_local_max!(candidate_channel, Q̄, d, deepcopy(hot_start); njumps=njumps)# produce the first candidate
     end
     for _ in 1:ntasks
         @spawn produce_candidates(candidate_channel, Q̄, d; njumps=njumps) # Spawn a thread to produce candidates
     end
-    return unprune(fetch(checker_task), pruned_indices) # Wait for the checker task to finish and unprune the solution
+    return fetch(checker_task) # Wait for the checker task to finish and unprune the solution
 end
 
-function decomposeq(Q̄)
+function separate_components(Q̄)
     indexsets = BitSet[]
     remaining = BitSet(axes(Q̄, 2)) # Create a BitSet of the indices of the columns of Q̄
     while(!isempty(remaining)) # While there are unexplored indices
@@ -39,7 +80,7 @@ function decomposeq(Q̄)
         push!(indexsets, index_set) # Add the explored indices to the indexsets
         setdiff!(remaining, index_set) # Remove the explored indices from the remaining indices
     end
-
+    return indexsets # Return the indexsets of the connected components
 end
 
 function explore(Q̄, i)
@@ -72,6 +113,7 @@ function unprune((; objective, x), pruned_indices)
 end
 
 function prunex!(x, pruned_indices)
+    isnothing(x) && return nothing # If x is nothing, return nothing
     for (; is) in pruned_indices
         deleteat!(x, is) # Remove the pruned indices from the solution vector
     end
@@ -277,13 +319,13 @@ function compute_objective(Q̄, d, x)
 end
 
 """
-    separateq(Q)
+    utform(Q)
 
 Separate the matrix `Q` into two parts: `Q̄` which contains the off-diagonal elements of the symmetric part of `Q` doubled, and `d` which contains the diagonal elements of `Q`.
 `Q` must be square and one-based indexed, but it need not be symmetric.
 returns `Q̄` and `d`.
 """
-function separateq(Q)
+function utform(Q)
     Q̄ = Q .+ Q' .- convert(eltype(Q), 2) * Diagonal(Q) # Create a new matrix with doubled off-diagonal elements
     d = convert(Vector, diag(Q)) # Extract the diagonal elements in a dense vector
     return Q̄, d
