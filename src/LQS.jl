@@ -2,7 +2,7 @@ module LQS
 
 export solve
 
-using LinearAlgebra, random, Base.Threads, Base.Checked
+using LinearAlgebra, Random, Base.Threads, Base.Checked
 
 """
     solve(Q::AbstractMatrix{<:Real},
