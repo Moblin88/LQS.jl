@@ -3,11 +3,13 @@ module LQS
 using LinearAlgebra
 using Random
 using Base.Threads
+using Base.Checked
 
 function solve(Q;
     hot_start=nothing,
     max_stagnation=size(Q, 1),
     max_candidates=10 * size(Q, 1),
+    exact_threshold = min(1.5*max_candidates, max_candidates),
     ntasks=Threads.threadpoolsize(),
     njumps=5,
     prune=true,
@@ -25,24 +27,33 @@ function solve(Q;
     else
         indexsets = [BitSet(axes(Q̄, 2))] # If not decomposing, use all indices as a single component
     end
-    obj = zero(T) # Initialize the objective value
-    x = Vector{T}(undef, size(Q̄, 2)) # Initialize the solution vector
-    for indexset in indexsets # For each connected component
+    tasks = map(indexsets) do indexset # For each connected component
         is = collect(indexset) # Convert the BitSet to a vector of indices
         #@info "Solving connected component with indices $(is)"
-        solution = solve(
+        if length(is) <= log2(exact_threshold+1) # If the number of indices is small enough, solve exactly
+            return @spawn (solution = solve_exact(Q̄[is,is], d[is]), is=is, exact=true) # Solve the connected component exactly
+        else # Otherwise, use the local search algorithm
+        return @spawn (solution = solve(
             Q̄[is,is], 
             d[is];
             hot_start=filterx(hot_start, is),
             max_stagnation=max_stagnation,
             max_candidates=max_candidates,
             ntasks=ntasks,
-            njumps=njumps)
-        obj += solution.objective # Update the objective value
-        x[is] .= solution.x # Update the solution vector with the solution for the connected component
+            njumps=njumps), is=is, exact=false) # Solve the connected component using local search
+        end
+    end
+    obj = zero(T) # Initialize the objective value
+    x = Vector{T}(undef, size(Q̄, 2)) # Initialize the solution vector
+    optimal = BitVector(undef, size(Q̄, 2))
+    for task in tasks # For each task
+        (;solution, is, exact) = fetch(task) # Wait for the task to finish and get the result
+        obj += solution.objective # Update the objective value with the solution from the task
+        x[is] .= solution.x # Update the solution vector with the solution from the task
+        optimal[is] .= exact # Update the optimal vector with the solution from the task
     end
     
-    return unprune((objective=obj, x=x), pruned_indices) # unprune the final result
+    return unprune!((objective=obj, x=x, optimal=optimal), pruned_indices) # unprune the final result
 end
 
 function filterx(x, indices)
@@ -102,14 +113,15 @@ end
 
 Reconstruct the original solution vector and objective value from a solution to a pruned problem.
 """
-function unprune((; objective, x), pruned_indices)
+function unprune!((; objective, x, optimal), pruned_indices)
     for (; is, xᵢ, objΔ) in Iterators.reverse(pruned_indices)
         for i in is
             insert!(x, i, xᵢ) # Insert the pruned values back into the solution vector
+            insert!(optimal, i, true) # Insert the pruned values back into the optimal vector
         end
         objective += objΔ # Update the objective value with the pruned values
     end
-    return (objective=objective, x=x) # Return the objective value and solution vector
+    return (objective=objective, x=x, optimal=optimal) # Return the objective value and solution vector
 end
 
 function prunex!(x, pruned_indices)
@@ -134,22 +146,16 @@ function prune!(pruned_indices, d::AbstractVector{<:Real}, Q̄::AbstractMatrix{<
     e = ones(T, axes(d))
     while (!isempty(d)) # While there are elements in d to prune
         resize!(e, length(d)) # each time through the loop the length of d may change
+        # prune the indices of Q̄ and d where x is always 0
+        zero_drops = muladd(max.(Q̄, zero(T)), e, d) .<= zero(T)
+        if any(zero_drops)
+            Q̄ = drop_indices!(pruned_indices, d, Q̄, zero(T), zero_drops) # drop the zeros from Q̄ and d
+            continue # continue pruning
+        end
         # prune the indices of Q̄ and d where x is always 1
-        one_drops = muladd(min.(Q̄, 0), e, d) .> zero(T)
+        one_drops = muladd(min.(Q̄, zero(T)), e, d) .>= zero(T)
         if any(one_drops)
             Q̄ = drop_indices!(pruned_indices, d, Q̄, one(T), one_drops) # drop the ones from Q̄ and d
-            continue # continue pruning
-        end
-        # prune the indices of Q̄ and d where x is always 0
-        zero_drops = muladd(max.(Q̄, 0), e, d) .< zero(T)
-        if any(zero_drops)
-            Q̄ = drop_indices!(pruned_indices, d, Q̄, zero(T), zero_drops) # drop the zeros from Q̄ and d
-            continue # continue pruning
-        end
-        # prune the indices of Q̄ and d where both are always 0
-        zero_drops = iszero.(d) .&& iszero.(eachcol(Q̄))
-        if any(zero_drops)
-            Q̄ = drop_indices!(pruned_indices, d, Q̄, zero(T), zero_drops) # drop the zeros from Q̄ and d
             continue # continue pruning
         end
         # if we reach here, we have no more elements to prune
@@ -215,6 +221,31 @@ function produce_candidates(candidate_channel, Q̄, d; kwargs...)
     end
 end
 
+function flips(n)
+    # It's really amazing that this works, but it does.
+    return Iterators.map(i -> trailing_zeros(i)+1,Base.OneTo(checked_pow(2,n)-1)) # Generate a sequence of indices to flip based on the binary representation of numbers from 1 to 2^n-1
+end
+
+function solve_exact(Q̄,d)
+    #@info "Solving exact problem with Q̄ \n$(sprint(show,"text/plain",Q̄)) \nand d = \n$(sprint(show,"text/plain",d))" # Log the problem being solved
+    T = promote_type(eltype(Q̄), eltype(d)) # Determine the type for the solution vector
+    n = size(Q̄, 2) # Get the number of variables
+    x = zeros(T,n) # Initialize the solution vector
+    objective = zero(T) # Initialize the best objective value
+    sensitivity = deepcopy(d) # Create a sensitivity vector to hold the sensitivity values
+    best = (objective = objective, x = deepcopy(x))# Initialize the best solution found so far
+    for i in flips(n) # For each combination of flips
+       objective += sensitivity[i] # Update the objective value with the sensitivity value for the flipped index
+       update_sensitivity!(sensitivity, Q̄, x, i) # Update the sensitivity vector based on the flipped index
+       @inbounds x[i] = one(T) - x[i] # Flip the ith bit in the solution vector
+        if objective > best.objective # If the objective value is better than the best found so far
+            best = (objective=objective, x=deepcopy(x)) # Update the best solution found so far
+        end
+    end
+
+    return best # Return the best objective value and solution vector
+end
+
 """
     update_sensitivity!(sensitivity, Q̄, x, i)
 
@@ -224,9 +255,11 @@ Faster than having to compute the sensitivity vector from scratch usin `compute_
 function update_sensitivity!(sensitivity, Q̄, x, i)
     col = view(Q̄, :, i) # Get the ith column of Q̄
     if isone(x[i]) # If the ith bit is 1, we need to subtract the column from the sensitivity vector
-        sensitivity .-= (one(eltype(x)) .- 2 .* x) .* col # If the ith bit is 1, subtract the column, otherwise add it
+        sensitivity .-= ifelse.(iszero.(x),col,.-col) # If the ith bit is 1, subtract the column, otherwise add it
+    elseif iszero(x[i]) # If the ith bit is 0, we need to add the column to the sensitivity vector
+        sensitivity .+= ifelse.(iszero.(x),col,.-col) # If the ith bit is 0, add the column, otherwise subtract it
     else
-        sensitivity .+= (one(eltype(x)) .- 2 .* x) .* col # If the ith bit is 0, add the column, otherwise subtract it
+        throw(ArgumentError("x[i] must be 0 or 1, got $(x[i])")) # If x[i] is not 0 or 1, throw an error    
     end
     sensitivity[i] = -sensitivity[i]
     return sensitivity
@@ -241,7 +274,7 @@ This function computes the sensitivity vector from scratch, which is slower than
 function set_sensitivity!(sensitivity, Q̄, d, x)
     sensitivity .= d # Initialize the sensitivity vector with the diagonal elements
     mul!(sensitivity, Q̄, x, true, true) # Compute the sensitivity vector
-    sensitivity .= ifelse.(isone.(x), .-sensitivity, sensitivity) # Flip the sign of the sensitivity vector where x is 1
+    sensitivity .= ifelse.(iszero.(x), sensitivity, .-sensitivity) # Flip the sign of the sensitivity vector where x is 1
     return sensitivity
 end
 
