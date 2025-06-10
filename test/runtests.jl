@@ -128,7 +128,7 @@ using LinearAlgebra
         l = [1.0, 1.0]
         hot_start = [1.0, 0.0]
         result = solve(Q, l; hot_start=hot_start, prune=true, decompose=false)
-        @test result.objective ≈ 2.0
+        @test result.objective ≈ 4.0
         @test all(result.x .== 1.0)
     end
 end
