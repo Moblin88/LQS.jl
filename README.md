@@ -34,10 +34,10 @@ where:
 ### ⚡ **Performance Optimizations**
 - **Multi-threading**: Parallel candidate generation and evaluation
 - **Efficient sensitivity updates**: Fast incremental objective function evaluation
-- **Memory-efficient**: Uses specialized data structures for binary variables
+- **Memory-efficient**: Uses specialized data structures for graph decompositions
 
 ### 🎯 **Adaptive Search Strategy**
-- **Jump-based exploration**: Performs multiple bit flips to escape local optima
+- **Jump-based exploration**: Performs multiple bit flips to rapidly improve random starting solutions
 - **Greedy improvement**: Iterative single-bit improvements for local optimization
 - **Stagnation detection**: Automatically terminates when no improvement is found
 
