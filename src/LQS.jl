@@ -2,7 +2,8 @@ module LQS
 
 export solve
 
-using LinearAlgebra, Random, Base.Threads, Base.Checked
+using LinearAlgebra, Base.Threads, Random, Base.Checked
+import Base.Threads: @spawn
 
 """
     solve(Q::AbstractMatrix{<:Real},
