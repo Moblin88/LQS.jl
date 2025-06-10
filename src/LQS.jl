@@ -52,26 +52,26 @@ function solve(Q::AbstractMatrix{<:Real},
         #@info "Solving connected component with indices $(is)"
         if length(is) <= log2(exact_threshold + 1) # If the number of indices is small enough, solve exactly
             @info "Solving connected component exactly with $(length(is)) variables"
-            @spawn put!(partial_solutions, (solution=solve_exact(Q̄[is, is], d[is]), is=is, exact=true)) # Solve the connected component exactly
+            @spawn put!(partial_solutions, (;solution=solve_exact(Q̄[is, is], d[is]), is, exact=true)) # Solve the connected component exactly
         else # Otherwise, use the local search algorithm
             @info "Solving connected component approximately with $(length(is)) variables"
-            @spawn put!(partial_solutions, (solution=solve_approx(
+            @spawn put!(partial_solutions, (;solution=solve_approx(
                     Q̄[is, is],
-                    d[is], (
+                    d[is], (;
                         hot_start=filterx(hot_start, is),
-                        max_stagnation=max_stagnation,
-                        max_candidates=max_candidates,
-                        ntasks=ntasks,
-                        njumps=njumps)), is=is, exact=false)) # Solve the connected component using local search
+                        max_stagnation,
+                        max_candidates,
+                        ntasks,
+                        njumps)), is, exact=false)) # Solve the connected component using local search
         end
     end
-    obj = β # Initialize the objective value
+    objective = β # Initialize the objective value
     x = Vector{T}(undef, size(Q̄, 2)) # Initialize the solution vector
     optimal = BitVector(undef, size(Q̄, 2))
     try
-        for _ in indexsets # For each index
+        for _ in indexsets # For each indexset
             (; solution, is, exact) = take!(partial_solutions) # Wait for a partial solution from the channel
-            obj += solution.objective # Update the objective value with the partial solution
+            objective += solution.objective # Update the objective value with the partial solution
             x[is] .= solution.x # Update the solution vector with the partial solution
             optimal[is] .= exact # Update the optimal vector with the partial solution
         end
@@ -79,7 +79,7 @@ function solve(Q::AbstractMatrix{<:Real},
         close(partial_solutions) # Close the channel to signal that we are done
     end
 
-    return unprune!((objective=obj, x=x, optimal=optimal), pruned_indices) # unprune the final result
+    return unprune!((;objective, x, optimal), pruned_indices) # unprune the final result
 end
 
 """
@@ -180,7 +180,7 @@ function unprune!((; objective, x, optimal), pruned_indices)
         end
         objective += objΔ # Update the objective value with the pruned values
     end
-    return (objective=objective, x=x, optimal=optimal) # Return the objective value and solution vector
+    return (;objective, x, optimal) # Return the objective value and solution vector
 end
 
 
@@ -245,7 +245,7 @@ function drop_indices!(pruned_indices, d, Q̄, xᵢ, drops)
         throw(ArgumentError("xᵢ must be 0 or 1, got $(xᵢ)")) # If xᵢ is not 0 or 1, throw an error
     end
     #@info "Pruning $(xᵢ) at indices $(findall(drops)) from Q̄ and d" # Log the elements being pruned
-    push!(pruned_indices, (is=findall(drops), xᵢ=xᵢ, objΔ=objΔ)) # push the indices of the elements that are pruned
+    push!(pruned_indices, (;is=findall(drops), xᵢ, objΔ)) # push the indices of the elements that are pruned
     deleteat!(d, drops) # delete the elements of d that are not needed anymore
     return Q̄[.!drops, .!drops] # delete the columns and rows of Q̄ that are not needed anymore  
 end
@@ -299,13 +299,13 @@ function solve_exact(Q̄, d)
     x = zeros(T, n) # Initialize the solution vector
     objective = zero(T) # Initialize the best objective value
     sensitivity = deepcopy(d) # Create a sensitivity vector to hold the sensitivity values
-    best = (objective=objective, x=deepcopy(x))# Initialize the best solution found so far
+    best = (;objective, x=deepcopy(x))# Initialize the best solution found so far
     for i in flips(n) # For each combination of flips
         objective += sensitivity[i] # Update the objective value with the sensitivity value for the flipped index
         update_sensitivity!(sensitivity, Q̄, x, i) # Update the sensitivity vector based on the flipped index
         @inbounds x[i] = one(T) - x[i] # Flip the ith bit in the solution vector
         if objective > best.objective # If the objective value is better than the best found so far
-            best = (objective=objective, x=deepcopy(x)) # Update the best solution found so far
+            best = (;objective, x=deepcopy(x)) # Update the best solution found so far
         end
     end
 
@@ -399,7 +399,7 @@ function put_local_max!(candidate_channel, Q̄, d, njumps, x::Vector=Vector{prom
     while isopen(candidate_channel) # Continue unless the channel is closed
         newobjective = step_update!(x, sensitivity, Q̄, objective) # Update the solution vector and objective value
         if newobjective == objective # If the objective value did not change, we are done
-            return put!(candidate_channel, (objective=objective, x=x)) # Put the candidate in the channel
+            return put!(candidate_channel, (;objective, x)) # Put the candidate in the channel
         else
             objective = newobjective # Update the objective value
         end
