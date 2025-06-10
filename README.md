@@ -9,7 +9,7 @@ A high-performance Julia package for solving Quadratic Unconstrained Binary Opti
 LQS (Local QUBO Solver) is designed to efficiently solve QUBO problems of the form:
 
 ```
-minimize/maximize: x^T Q x + ℓ^T x + β
+maximize: x^T Q x + ℓ^T x + β
 subject to: x ∈ {0,1}^n
 ```
 
