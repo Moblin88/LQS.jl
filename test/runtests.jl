@@ -122,4 +122,13 @@ using LinearAlgebra
         x2 = [1.0, 1.0]
         @test LQS.prunex!(x2, pruned_indices) == [1.0]
     end
+
+    @testset "LQS.solve with hot_start and pruning" begin
+        Q = [0.0 1.0; 1.0 0.0]
+        l = [1.0, 1.0]
+        hot_start = [1.0, 0.0]
+        result = solve(Q, l; hot_start=hot_start, prune=true, decompose=false)
+        @test result.objective ≈ 2.0
+        @test all(result.x .== 1.0)
+    end
 end
